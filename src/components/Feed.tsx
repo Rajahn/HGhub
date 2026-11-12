@@ -12,6 +12,7 @@ import { RowCard } from "./cards";
 import { setBackHandler } from "../back";
 import { copyText } from "../clipboard";
 import { tracePlayback } from "../playbackDiagnostics";
+import { DownloadButton } from "../download";
 import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
   ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute,
@@ -1006,6 +1007,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <ILink size={25} className="hg-ink hg-ov-shadow" />
                     <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">分享</span>
                   </button>
+                  <DownloadButton url={playUrl} title={meta.title} episode={curEp} variant="rail" />
                 </div>
               )}
 
@@ -1052,6 +1054,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <ILink size={25} className="text-white tsh" />
                   <span className="text-[10.5px] text-white/90">分享</span>
                 </button>
+                <DownloadButton url={playUrl} title={meta.title} episode={curEp} variant="rail" />
               </div>
               )}
 
@@ -1346,6 +1349,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           <span>收藏 {fmt(meta.collect)}</span>
                           <span>评论 {fmt(meta.comment)}</span>
                         </div>
+                        <DownloadButton url={playUrl} title={meta.title} episode={curEp} variant="row" />
                       </div>
                     </div>
 

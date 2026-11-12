@@ -14,6 +14,7 @@ import { TopicsPage, TopicPage, TagsPage, TagPage } from "./pages/Discover";
 import { FollowingPage, UserPage } from "./pages/User";
 import LoginModal from "./components/LoginModal";
 import { ToastHost } from "./components/ui";
+import { DownloadBanner } from "./download";
 import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
 import ResizeHandles from "./components/ResizeHandles";
 import { tracePlayback } from "./playbackDiagnostics";
@@ -340,6 +341,7 @@ export default function App() {
     <>
       {isMobile ? <MobileShell /> : <DesktopShell />}
       <LoginModal />
+      <DownloadBanner />
       <ToastHost />
       {/* 登录遮罩键盘处理占位 */}
       {loginOpen && <div className="hidden" onClick={() => setLoginOpen(false)} />}

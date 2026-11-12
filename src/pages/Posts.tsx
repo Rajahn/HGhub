@@ -5,6 +5,7 @@ import { useStore } from "../store";
 import { copyText } from "../clipboard";
 import { Empty, Img } from "../components/ui";
 import Player from "../components/Player";
+import { DownloadButton } from "../download";
 import { IBack, IFireF, IPlayF, ISearch } from "../icons";
 import { handleArticleClick, sanitizeHtml } from "../html";
 import { InplaceSearch } from "../components/InplaceSearch";
@@ -213,6 +214,7 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
             </div>
             <div className="px-4 pt-3.5">
               <h1 className="text-[17px] font-bold text-on leading-snug">{post.title}</h1>
+              {src && <DownloadButton url={src} title={post.title} episode={segs.length > 1 ? seg + 1 : 0} variant="row" />}
               <div className="flex items-center gap-2 mt-2 text-[10.5px] text-mut">
                 <span>{post.publish_time || post.created_at}</span>
                 <span className="flex items-center gap-1"><IFireF size={10} />{fmt(post.hot)}</span>

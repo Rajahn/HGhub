@@ -1707,10 +1707,12 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "huangguo-client"
-version = "1.2.19"
+version = "1.2.20"
 dependencies = [
  "aes",
  "base64 0.22.1",
+ "jni",
+ "ndk-context",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

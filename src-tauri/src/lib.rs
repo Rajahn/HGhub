@@ -1,7 +1,9 @@
 mod api;
+mod hls_download;
 #[cfg(target_os = "ios")]
 mod ios_layout;
 mod lines;
+mod local_media;
 #[cfg(target_os = "linux")]
 mod linux_http;
 mod logging;
@@ -13,6 +15,7 @@ mod net;
 mod network_policy;
 mod playback_log;
 mod session;
+mod ts_mp4;
 
 use api::Api;
 use tauri::Manager;
@@ -58,6 +61,7 @@ pub fn run() {
                 .build(),
         )
         .manage(Api::new())
+        .manage(hls_download::Downloads::new())
         .on_page_load(|webview, payload| {
             #[cfg(target_os = "ios")]
             {
@@ -223,6 +227,10 @@ pub fn run() {
             api::api_like,
             api::api_collect,
             api::api_follow,
+            hls_download::download_start,
+            hls_download::download_cancel,
+            hls_download::download_list,
+            hls_download::download_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
