@@ -55,7 +55,7 @@ export const playlist = (url: string) => `${LOCAL}/hls?u=${encodeURIComponent(ur
 export const logLine = (msg: string) => invoke("debug_log", { msg }).catch(() => {});
 
 /** 网络类失败的样子：没有 HTTP 状态码，纯链路层（DNS / 连接 / 超时 / TLS） */
-const NET_FAIL = /dns|timed? ?out|timeout|connection|refused|reset|unreachable|broken pipe|tls|ssl|handshake|证书|网络|连接/i;
+const NET_FAIL = /dns|timed? ?out|timeout|connection|refused|reset|unreachable|broken pipe|tls|ssl|handshake|sending request|error sending|证书|网络|连接|超时|中断/i;
 /** 只读命令：链路抖动时可以安全重试一次；写操作绝不重试（避免重复提交） */
 const READ_ONLY = new Set([
   "api_me", "api_feed", "api_category", "api_rank", "api_search",

@@ -26,6 +26,8 @@ type Props = {
   muted?: boolean;
   loop?: boolean;
   fit?: "contain" | "cover";
+  /** 本地文件的续播秒数，只在换源时应用一次 */
+  startAt?: number;
   /** 换源后重新套用，避免切集时音量/倍速被浏览器重置 */
   volume?: number;
   rate?: number;
@@ -43,7 +45,7 @@ type Props = {
 
 /** 只负责「播」：hls.js + video 元素，控制条由外层渲染。 */
 const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
-  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain", volume = 1, rate = 1,
+  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain", volume = 1, rate = 1, startAt = 0,
     onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
   ref,
 ) {
@@ -104,7 +106,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
     const proxied = isLocalMedia(src);
     const url = proxied ? src : playlist(src);
-    const useHls = !url.includes("/seg?u=");
+    const directFile = /\/local(?:\?|$)/.test(url);
+    const useHls = !directFile && !url.includes("/seg?u=");
     trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
 
     /* 换源时先把音量/倍速套回去：hls 重新 attach 后浏览器会把它们重置成默认值 */
@@ -244,6 +247,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       onLoadedMetadata={(e) => {
         const v = e.target as HTMLVideoElement;
         reapply(v);
+        if (startAt > 1 && Number.isFinite(v.duration) && startAt < v.duration - 1) v.currentTime = startAt;
         onDuration?.(v.duration || 0);
         reportSize(v);
       }}

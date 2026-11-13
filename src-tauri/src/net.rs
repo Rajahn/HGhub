@@ -133,16 +133,21 @@ fn proxy_override() -> Option<String> {
 /// 注意：reqwest 的 `system-proxy` 只在构建时读一次注册表 / 环境变量。代理软件被关掉后，
 /// 旧客户端仍会往 `127.0.0.1:7897` 建隧道，症状是满屏 `tunnel error: failed to create
 /// underlying connection`（浏览器却是通的，因为它每次都重读系统代理）。所以这里允许重建。
-fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+fn build_client(host: &str, addrs: &[SocketAddr], identity: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .referer(false)
-        .gzip(true)
-        .brotli(true)
-        .pool_idle_timeout(Duration::from_secs(60));
+        // 移动网络会拆掉空闲连接。空闲太久的连接被复用时，reqwest 只显示
+        // “error sending request”，所以缩短连接池并打开 TCP keepalive。
+        .pool_idle_timeout(Duration::from_secs(15))
+        .tcp_keepalive(Duration::from_secs(15));
+    // 整文件下载必须看到原始字节和 Content-Length。gzip 会让断点偏移和正文长度对不上。
+    if !identity {
+        builder = builder.gzip(true).brotli(true);
+    }
     if !addrs.is_empty() {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -172,15 +177,15 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
 /// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
 /// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
 async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
-    client_for_dns(raw, false).await
+    client_for_dns(raw, false, false).await
 }
 
-async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+async fn client_for_dns(raw: &str, public_dns: bool, identity: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let key = format!("{strict}:{host}:{port}:{public_dns}");
+    let key = format!("{strict}:{host}:{port}:{public_dns}:{identity}");
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
@@ -188,7 +193,7 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
         }
     }
     let (addrs, ttl) = if public_dns {
-        let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)?;
+        let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP, false)?;
         let resolution = crate::media_dns::resolve(&resolver, host, port).await?;
         network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
         (resolution.addresses, CLIENT_TTL.min(resolution.ttl))
@@ -197,7 +202,7 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
     } else {
         (Vec::new(), CLIENT_TTL)
     };
-    let http = Arc::new(build_client(host, &addrs)?);
+    let http = Arc::new(build_client(host, &addrs, identity)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
     // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
@@ -246,7 +251,7 @@ async fn get_with_dns(
         let mut next = network_policy::parse_target(raw).map_err(|e| policy_error("parse", e))?;
         for hop in 0..=5 {
             let resolving = Instant::now();
-            let (target, http) = client_for_dns(next.as_str(), public_dns).await.map_err(|e| policy_error("dns_or_client", e))?;
+            let (target, http) = client_for_dns(next.as_str(), public_dns, false).await.map_err(|e| policy_error("dns_or_client", e))?;
             crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
             let mut request = http.get(target.clone()).timeout(timeout);
             if let Some(value) = accept {
@@ -305,11 +310,7 @@ static LAST_HEAL: Lazy<std::sync::Mutex<Option<Instant>>> =
 /// 请求失败后按需重建客户端：代理隧道错误、连接被拒 / 超时都算「网络环境可能变了」。
 /// 3 秒内只重建一次，批量探测不会反复重建。
 pub fn heal_client(reason: &str) {
-    let connectish = reason.contains("Connect")
-        || reason.contains("timed out")
-        || reason.contains("refused")
-        || reason.contains("dns");
-    if !is_proxy_error(reason) && !connectish {
+    if !is_proxy_error(reason) && !crate::download_plan::should_refresh_client(reason) {
         return;
     }
     let mut last = match LAST_HEAL.lock() {
@@ -685,7 +686,7 @@ where
     Fut: std::future::Future<Output = Result<T, String>>,
 {
     let mut last = String::from("network error");
-    let attempts = if retry { 3 } else { 1 };
+    let attempts = crate::download_plan::attempts_for(retry);
     for attempt in 0..attempts {
         match f().await {
             Ok(v) => return Ok(v),
@@ -696,7 +697,7 @@ where
                 }
                 heal_client(&last);
                 if attempt + 1 < attempts {
-                    tokio::time::sleep(Duration::from_millis(350 * (attempt as u64 + 1))).await;
+                    tokio::time::sleep(crate::download_plan::retry_delay(attempt)).await;
                 }
             }
         }
@@ -872,7 +873,8 @@ pub async fn edge(
             result
         }
     })
-    .await?;
+    .await
+    .map_err(|err| crate::download_plan::user_facing_net_error(&err))?;
 
     if value.is_null() {
         return Ok(Value::Null);
@@ -952,6 +954,69 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         }
     })
     .await
+    .map_err(|err| crate::download_plan::user_facing_net_error(&err))
+}
+
+pub struct OpenedDownload {
+    pub status: u16,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_length: Option<u64>,
+    pub content_range: Option<String>,
+    pub content_type: Option<String>,
+    pub response: Option<reqwest::Response>,
+}
+
+fn header_text(headers: &reqwest::header::HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers.get(name).and_then(|value| value.to_str().ok()).map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
+}
+
+/// 整文件下载。请求头阶段 20 秒超时；正文单独放宽，并由调用方按 20 秒无数据判断卡死。
+/// 不启用压缩，保证 Range / Content-Length 对的是原始字节。
+pub async fn open_download(raw: &str, range_from: Option<u64>, if_range: Option<&str>) -> Result<OpenedDownload, String> {
+    let mut next = network_policy::parse_target(raw)?;
+    for hop in 0..=5 {
+        let (target, http) = client_for_dns(next.as_str(), false, true).await?;
+        let mut request = http.get(target.clone()).timeout(Duration::from_secs(3 * 60 * 60));
+        if let Some(from) = range_from {
+            request = request.header(reqwest::header::RANGE, format!("bytes={from}-"));
+        }
+        if let Some(validator) = if_range.filter(|value| !value.is_empty()) {
+            request = request.header(reqwest::header::IF_RANGE, validator);
+        }
+        request = request.header(reqwest::header::ACCEPT, "*/*");
+        let response = tokio::time::timeout(Duration::from_secs(20), request.send())
+            .await
+            .map_err(|_| "请求超时".to_string())?
+            .map_err(|err| err_text(&err))?;
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if hop == 5 {
+                return Err("重定向次数超过限制".into());
+            }
+            let location = response.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok()).ok_or("重定向缺少有效 Location")?;
+            next = network_policy::redirect_target(&target, location)?;
+            continue;
+        }
+        let headers = response.headers();
+        let opened = OpenedDownload {
+            status,
+            etag: header_text(headers, reqwest::header::ETAG),
+            last_modified: header_text(headers, reqwest::header::LAST_MODIFIED),
+            content_length: header_text(headers, reqwest::header::CONTENT_LENGTH).and_then(|value| value.parse().ok()),
+            content_range: header_text(headers, reqwest::header::CONTENT_RANGE),
+            content_type: header_text(headers, reqwest::header::CONTENT_TYPE),
+            response: None,
+        };
+        if status == 416 {
+            return Ok(opened);
+        }
+        if status != 200 && status != 206 {
+            return Err(format!("HTTP {status}"));
+        }
+        return Ok(OpenedDownload { response: Some(response), ..opened });
+    }
+    Err("重定向次数超过限制".into())
 }
 
 #[cfg(test)]
@@ -973,7 +1038,7 @@ mod tests {
             .unwrap();
         refresh_client();
         CLIENTS.lock().unwrap().insert(
-            format!("{}:{host}:{port}:false", network_policy::strict_security()),
+            format!("{}:{host}:{port}:false:false", network_policy::strict_security()),
             (Instant::now() + CLIENT_TTL, Arc::new(failed_client)),
         );
         let (_, bytes) = fetch_bytes(&raw).await.expect("备用 DNS 应恢复真实媒体下载");
@@ -1045,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn non_idempotent_operations_are_attempted_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for (retry, expected) in [(false, 1), (true, 3)] {
+        for (retry, expected) in [(false, 1), (true, 4)] {
             let calls = AtomicUsize::new(0);
             let result = with_retry(retry, || async {
                 calls.fetch_add(1, Ordering::SeqCst);

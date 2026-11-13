@@ -12,6 +12,7 @@ import { RowCard } from "./cards";
 import { setBackHandler } from "../back";
 import { copyText } from "../clipboard";
 import { tracePlayback } from "../playbackDiagnostics";
+import { DownloadButton, localMediaUrl, startSeries, useDownloadJobs } from "../download";
 import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
   ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute,
@@ -132,10 +133,19 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const playKey = `${curId}:${curEp}`;
   const mainUrl = playUrls[playKey] || "";
   const hevcUrl = hevcUrls[playKey] || "";
-  const playUrl = preferHevc && hevcUrl ? hevcUrl : mainUrl;
+  const downloadJobs = useDownloadJobs();
+  const savedEpisode = downloadJobs.find((job) => job.phase === "done" && job.video_id === curId && job.episode === curEp);
+  const offlineSrc = savedEpisode ? localMediaUrl(savedEpisode.id) : "";
+  const playUrl = offlineSrc || (preferHevc && hevcUrl ? hevcUrl : mainUrl);
+  const playRefresh = useRef(0);
+  useEffect(() => { playRefresh.current = 0; }, [playKey]);
   useEffect(() => { setZoom({ s: 1, x: 0, y: 0, g: false }); pinchRef.current = null; pointersRef.current.clear(); }, [playUrl]);
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
+  const downloadAll = () => {
+    if (kind !== "video" || episodes.length < 2) return;
+    startSeries(curId, detail?.title || "", episodes.map((item) => item.ep_num)).catch((e) => toast((e as Error).message || "无法加入下载", "info"));
+  };
   const post = posts[curId];
 
   /* 观看进度：onTime 里每 5 秒落一次；退出播放页时再用 liveRef 兜一次 */
@@ -146,6 +156,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (duration > 0 && now - lastSaveRef.current > 5000) {
       lastSaveRef.current = now;
       addHistory(curId, curEp, t, duration);
+      if (savedEpisode) invoke("download_progress", { id: savedEpisode.id, position: t, duration }).catch(() => {});
     }
   };
 
@@ -858,6 +869,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   onPointerDown={onDown} onPointerMove={onMove} onPointerUp={(e) => onUp(false, e)} onPointerCancel={(e) => onUp(true, e)} onLostPointerCapture={(e) => onUp(true, e)}>
                 <div style={{ position: "absolute", inset: 0, transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s})`, transformOrigin: "center center", transition: zoom.g ? "none" : "transform .18s ease-out" }}>
                 <VideoSurface ref={videoRef} src={playUrl} poster={posterUrl} autoPlay active={active} muted={muted}
+                  startAt={offlineSrc ? savedEpisode?.position || 0 : 0}
                   diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
                   volume={volume} rate={effRate}
                   fit={isDesktop ? "contain" : landscapeVideo ? (fs || vpLandscape ? "contain" : portraitFit) : (vpLandscape ? "contain" : "cover")}
@@ -870,8 +882,15 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   onWaiting={() => setWaiting(true)}
                   onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
                   onError={(m) => {
+                    if (!offlineSrc && playRefresh.current < 1 && /network|frag|manifest|发送|超时|连接|请求/.test(m)) {
+                      playRefresh.current += 1;
+                      setPlayUrls((map) => { const next = { ...map }; delete next[playKey]; return next; });
+                      setHevcUrls((map) => { const next = { ...map }; delete next[playKey]; return next; });
+                      setErr("播放地址可能已失效，正在重新获取");
+                      return;
+                    }
                     setErr(m);
-                    if (preferHevc && hevcUrl) {
+                    if (preferHevc && hevcUrl && !offlineSrc) {
                       setPreferHevc(false);
                       toast("高清播不了，已切回标准", "info");
                     }
@@ -1006,6 +1025,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     <ILink size={25} className="hg-ink hg-ov-shadow" />
                     <span className="text-[10.5px] hg-ink-2 hg-ov-shadow">分享</span>
                   </button>
+                  <DownloadButton url={offlineSrc || mainUrl} title={meta.title} episode={curEp} videoId={kind === "video" ? curId : 0} variant="rail" />
                 </div>
               )}
 
@@ -1052,6 +1072,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <ILink size={25} className="text-white tsh" />
                   <span className="text-[10.5px] text-white/90">分享</span>
                 </button>
+                <DownloadButton url={offlineSrc || mainUrl} title={meta.title} episode={curEp} videoId={kind === "video" ? curId : 0} variant="rail" />
               </div>
               )}
 
@@ -1286,7 +1307,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         <div className={`desktop-dock-panel ${panel ? "is-open" : ""}`}>
           <div className="desktop-dock-inner">
             {panel === "episodes" ? (
-              <EpisodesPanel videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} />
+              <EpisodesPanel videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} onDownloadAll={kind === "video" ? downloadAll : undefined} />
             ) : panel === "comments" ? (
               <CommentsPanel videoId={curId} ep={curEp} total={meta.comment} kind={kind} onClose={() => setPanel(null)} />
             ) : null}
@@ -1327,7 +1348,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
               <div className="flex-1 min-h-0">
                 {panel === "episodes" ? (
-                  <EpisodesPanel bare videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} />
+                  <EpisodesPanel bare videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} onDownloadAll={kind === "video" ? downloadAll : undefined} />
                 ) : (
                   <div className="h-full scroll-y px-4 pb-5">
                     {/* 封面 / 标题 / 评分 / 数据 */}
@@ -1346,6 +1367,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           <span>收藏 {fmt(meta.collect)}</span>
                           <span>评论 {fmt(meta.comment)}</span>
                         </div>
+                        <DownloadButton url={offlineSrc || mainUrl} title={meta.title} episode={curEp} videoId={kind === "video" ? curId : 0} variant="row" />
+                        {kind === "video" && episodes.length > 1 && (
+                          <button type="button" onClick={() => startSeries(curId, meta.title, episodes.map((item) => item.ep_num)).catch((e) => toast((e as Error).message || "无法加入下载", "info"))}
+                            className="mt-2 flex h-10 w-full items-center justify-center rounded-full bg-s3 text-[12.5px] font-semibold text-on pressable">
+                            下载全集 · {episodes.length} 集
+                          </button>
+                        )}
                       </div>
                     </div>
 

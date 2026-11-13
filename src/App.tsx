@@ -14,6 +14,8 @@ import { TopicsPage, TopicPage, TagsPage, TagPage } from "./pages/Discover";
 import { FollowingPage, UserPage } from "./pages/User";
 import LoginModal from "./components/LoginModal";
 import { ToastHost } from "./components/ui";
+import { DownloadBanner } from "./download";
+import LibraryPage from "./pages/Library";
 import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
 import ResizeHandles from "./components/ResizeHandles";
 import { tracePlayback } from "./playbackDiagnostics";
@@ -114,6 +116,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
   if (page.kind === "tag") return <TagPage tag={page.tag} name={page.name} onBack={onBack} wide={wide} />;
   if (page.kind === "following") return <FollowingPage onBack={onBack} wide={wide} />;
   if (page.kind === "user") return <UserPage id={page.id} name={page.name} onBack={onBack} wide={wide} />;
+  if (page.kind === "library") return <LibraryPage onBack={onBack} />;
   return null;
 }
 
@@ -340,6 +343,7 @@ export default function App() {
     <>
       {isMobile ? <MobileShell /> : <DesktopShell />}
       <LoginModal />
+      <DownloadBanner />
       <ToastHost />
       {/* 登录遮罩键盘处理占位 */}
       {loginOpen && <div className="hidden" onClick={() => setLoginOpen(false)} />}

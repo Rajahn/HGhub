@@ -8,10 +8,11 @@ import { Avatar, Empty } from "./ui";
 import { IClose, IHeart, ISendF } from "../icons";
 
 /* ================= 选集 ================= */
-export function EpisodesPanel({ videoId, episodes, current, onPick, onClose, bare = false }: {
+export function EpisodesPanel({ videoId, episodes, current, onPick, onClose, bare = false, onDownloadAll }: {
   videoId: number; episodes: Episode[]; current: number; onPick: (ep: number) => void; onClose: () => void;
   /** 嵌在双栏抽屉里时，隐藏自带的标题栏与底注 */
   bare?: boolean;
+  onDownloadAll?: () => void;
 }) {
   const [asc, setAsc] = useState(true);
   const list = asc ? episodes : [...episodes].reverse();
@@ -20,12 +21,14 @@ export function EpisodesPanel({ videoId, episodes, current, onPick, onClose, bar
       {bare ? (
         <div className="shrink-0 flex items-center gap-2 px-4 pb-2">
           <span className="text-[10.5px] text-mut">共 {episodes.length} 集</span>
+          {onDownloadAll && episodes.length > 1 && <button onClick={onDownloadAll} className="text-[11px] font-semibold text-primary pressable">下载全集</button>}
           <button onClick={() => setAsc((v) => !v)} className="ml-auto text-[11px] text-primary pressable">{asc ? "倒序" : "正序"}</button>
         </div>
       ) : (
         <div className="shrink-0 flex items-center gap-2 px-4 h-12">
           <span className="text-[13.5px] font-bold text-on">选集</span>
           <span className="text-[10.5px] text-mut">共 {episodes.length} 集</span>
+          {onDownloadAll && episodes.length > 1 && <button onClick={onDownloadAll} className="text-[11px] font-semibold text-primary pressable">下载全集</button>}
           <button onClick={() => setAsc((v) => !v)} className="ml-auto text-[11px] text-primary pressable">{asc ? "倒序" : "正序"}</button>
           <button onClick={onClose} aria-label="关闭" className="w-7 h-7 rounded-full bg-s3 flex items-center justify-center text-mut pressable">
             <IClose size={13} />

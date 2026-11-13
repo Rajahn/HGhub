@@ -727,38 +727,48 @@ fn has_play_url(info: &Value) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
-#[tauri::command]
-pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    // 优先走新接口；失败或没有可用地址时退回旧接口，两者都不行就返回新接口的结果/错误。
-    let primary = state
-        .post(
-            &format!("/api/videos/{id}/episodes/{ep}/playback"),
-            Some(json!({})),
-        )
-        .await
-        .map(|mut info| {
-            normalize_play_info(&mut info);
-            info
-        });
-    if let Ok(info) = &primary {
-        if has_play_url(info) {
-            return primary;
+impl Api {
+    /// 重新向播放接口要地址。只接受 HTTPS，供下载在 401/403/410 时换一次源。
+    pub async fn fresh_play_url(&self, id: i64, ep: u32) -> Result<String, String> {
+        let info = self.play_info(id, ep).await?;
+        let url = info.get("video_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if url.starts_with("https://") {
+            Ok(url)
+        } else {
+            Err("播放接口没有返回可用的 HTTPS 地址".into())
         }
     }
-    match state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
-    {
-        Ok(mut legacy) => {
-            normalize_play_info(&mut legacy);
-            if has_play_url(&legacy) || primary.is_err() {
-                Ok(legacy)
-            } else {
-                primary
+
+    async fn play_info(&self, id: i64, ep: u32) -> Result<Value, String> {
+        let primary = self
+            .post(&format!("/api/videos/{id}/episodes/{ep}/playback"), Some(json!({})))
+            .await
+            .map(|mut info| {
+                normalize_play_info(&mut info);
+                info
+            });
+        if let Ok(info) = &primary {
+            if has_play_url(info) {
+                return primary;
             }
         }
-        Err(_) => primary,
+        match self.get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0")).await {
+            Ok(mut legacy) => {
+                normalize_play_info(&mut legacy);
+                if has_play_url(&legacy) || primary.is_err() {
+                    Ok(legacy)
+                } else {
+                    primary
+                }
+            }
+            Err(_) => primary,
+        }
     }
+}
+
+#[tauri::command]
+pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
+    state.play_info(id, ep).await
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
