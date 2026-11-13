@@ -27,6 +27,24 @@ pub fn publish(src: &Path, name: &str, mime: &str) -> Result<Published, String> 
     }
 }
 
+/// 只在用户删除离线视频时调用。删不掉系统副本时，应用内文件仍会删掉。
+pub fn remove(token: &str) -> Result<(), String> {
+    if token.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "android")]
+    {
+        android::remove(token)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if !token.starts_with("content:") {
+            let _ = std::fs::remove_file(token);
+        }
+        Ok(())
+    }
+}
+
 pub fn open(token: &str, mime: &str) -> Result<(), String> {
     if token.is_empty() {
         return Err("没有可打开的文件".into());
@@ -91,6 +109,29 @@ mod android {
                 legacy_download(env, &path, name).or_else(|_| app_file(env, context, &path, name))
             }
         })
+    }
+
+    pub fn remove(token: &str) -> Result<(), String> {
+        if token.starts_with("content:") {
+            return with_env(|env, context| {
+                let resolver = env
+                    .call_method(context, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+                    .map_err(|e| e.to_string())?
+                    .l()
+                    .map_err(|e| e.to_string())?;
+                let raw = env.new_string(token).map_err(|e| e.to_string())?;
+                let uri = env
+                    .call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&raw)])
+                    .map_err(|e| e.to_string())?
+                    .l()
+                    .map_err(|e| e.to_string())?;
+                env.call_method(&resolver, "delete", "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I", &[JValue::Object(&uri), JValue::Object(&JObject::null()), JValue::Object(&JObject::null())])
+                    .map_err(|_| "无法删除系统下载目录中的副本".to_string())?;
+                Ok(())
+            });
+        }
+        let _ = std::fs::remove_file(token);
+        Ok(())
     }
 
     pub fn open(token: &str, mime: &str) -> Result<(), String> {

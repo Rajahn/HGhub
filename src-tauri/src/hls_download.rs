@@ -4,53 +4,22 @@
 //! 普通 HLS（无加密，或播放器本来就会解的 AES-128 identity 密钥）会把分片
 //! 收成一个可播放文件。SAMPLE-AES、Widevine、PlayReady、FairPlay 直接拒绝。
 
-use crate::net::fetch_bytes;
+use crate::download_plan::{assembly_indexes, hls_fingerprint, reusable_segments, HlsIdentity};
 use crate::ts_mp4;
 use aes::cipher::{BlockDecrypt, KeyInit};
 #[cfg(test)]
 use aes::cipher::BlockEncrypt;
 use aes::Aes128;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager, State};
+use std::sync::Arc;
 
 const MAX_BYTES: usize = 800 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 4000;
 
-#[derive(Clone, Serialize)]
-pub struct DownloadView {
-    pub id: u64,
-    pub title: String,
-    pub url: String,
-    pub episode: u32,
-    pub phase: String,
-    pub received: u64,
-    pub total: u64,
-    pub index: u32,
-    pub count: u32,
-    pub message: String,
-    pub path: String,
-    pub token: String,
-    pub bytes: u64,
-}
-
-struct Job {
-    view: DownloadView,
-    cancel: Arc<AtomicBool>,
-}
-
-pub struct Downloads {
-    jobs: Arc<Mutex<Vec<Job>>>,
-}
-
-impl Downloads {
-    pub fn new() -> Self {
-        Self { jobs: Arc::new(Mutex::new(Vec::new())) }
-    }
-}
 
 pub struct MediaFile {
     pub bytes: Vec<u8>,
@@ -498,7 +467,7 @@ fn aes128_cbc_encrypt(data: &[u8], key: &[u8], iv: &[u8; 16]) -> Vec<u8> {
     out
 }
 
-fn file_name(title: &str, episode: u32, extension: &str) -> String {
+pub(crate) fn file_name(title: &str, episode: u32, extension: &str) -> String {
     let mut safe: String = title.chars().map(|ch| match ch {
         '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
         ch if ch.is_control() => '_',
@@ -515,141 +484,202 @@ fn file_name(title: &str, episode: u32, extension: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub async fn download_start(app: AppHandle, state: State<'_, Downloads>, url: String, title: String, episode: u32) -> Result<DownloadView, String> {
-    let url = url.trim().to_string();
-    if url.is_empty() {
-        return Err("还没有可下载的视频地址".into());
-    }
-    crate::network_policy::parse_target(&url)?;
-    let jobs = Arc::clone(&state.jobs);
-    {
-        let list = jobs.lock().map_err(|_| "下载状态不可用")?;
-        if let Some(job) = list.iter().find(|job| job.view.phase == "running" && job.view.url == url) {
-            return Ok(job.view.clone());
-        }
-        if list.iter().any(|job| job.view.phase == "running") {
-            return Err("已有下载在进行，请先取消或等待完成".into());
-        }
-    }
-    let id = {
-        let mut list = jobs.lock().map_err(|_| "下载状态不可用")?;
-        let id = list.iter().map(|job| job.view.id).max().unwrap_or(0) + 1;
-        list.push(Job {
-            view: DownloadView {
-                id, title: title.clone(), url: url.clone(), episode, phase: "running".into(),
-                received: 0, total: 0, index: 0, count: 0, message: "正在准备".into(), path: String::new(), token: String::new(), bytes: 0,
-            },
-            cancel: Arc::new(AtomicBool::new(false)),
-        });
-        if list.len() > 8 {
-            let running = list.iter().position(|job| job.view.phase == "running");
-            if list.len() > 8 {
-                if let Some(drop_at) = list.iter().position(|job| job.view.phase != "running") {
-                    if running != Some(drop_at) {
-                        list.remove(drop_at);
-                    }
-                }
+#[derive(Serialize, Deserialize)]
+struct HlsManifest {
+    fingerprint: String,
+    count: u32,
+    complete: Vec<u32>,
+}
+
+fn seg_file(dir: &Path, index: u32) -> PathBuf {
+    dir.join(format!("seg-{index:05}.bin"))
+}
+
+fn clear_hls_parts(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("seg-") || name == "init.bin" || name == "joined.part" || name == "ready" {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-        id
+    }
+}
+
+fn load_manifest(dir: &Path) -> Option<HlsManifest> {
+    std::fs::read_to_string(dir.join("manifest.json")).ok().and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn store_manifest(dir: &Path, manifest: &HlsManifest) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|_| "无法创建分片目录")?;
+    let tmp = dir.join("manifest.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(manifest).map_err(|_| "无法记录分片进度")?).map_err(|_| "无法记录分片进度")?;
+    std::fs::rename(&tmp, dir.join("manifest.json")).map_err(|_| "无法记录分片进度".to_string())
+}
+
+/// 已完成的分片落在目录里。播放列表身份变了就清空，绝不把旧分片拼进新列表。
+pub(crate) async fn download_hls_resumable<F, Fut>(
+    url: &str,
+    dir: &Path,
+    fetch: F,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64, u32, u32),
+) -> Result<PathBuf, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    std::fs::create_dir_all(dir).map_err(|_| "无法创建分片目录")?;
+    if dir.join("ready").is_file() {
+        if let Some(path) = finished_media(dir) {
+            return Ok(path);
+        }
+        let _ = std::fs::remove_file(dir.join("ready"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已暂停".into());
+    }
+    let first = fetch(url.to_string()).await?;
+    let text = std::str::from_utf8(&first).map_err(|_| "播放列表不是文本")?;
+    let playlist = parse_playlist(url, text)?;
+    let media = match playlist {
+        Playlist::Media(media) => media,
+        Playlist::Master(variants) => {
+            let variant = pick_variant(&variants).ok_or("播放列表里没有可下载的视频流")?;
+            let nested = fetch(variant.url.clone()).await?;
+            let nested_text = std::str::from_utf8(&nested).map_err(|_| "播放列表不是文本")?;
+            match parse_playlist(&variant.url, nested_text)? {
+                Playlist::Media(media) => media,
+                Playlist::Master(_) => return Err("嵌套的播放列表无法展开".into()),
+            }
+        }
     };
-    let cancel = jobs.lock().ok().and_then(|list| list.iter().find(|job| job.view.id == id).map(|job| Arc::clone(&job.cancel))).unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let jobs_task = Arc::clone(&jobs);
-    let title_task = title.clone();
-    tauri::async_runtime::spawn(async move {
-        let cache = app.path().app_cache_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-        let _ = std::fs::create_dir_all(&cache);
-        let progress_jobs = Arc::clone(&jobs_task);
-        let result = build_media(&url, |target| async move { fetch_bytes(&target).await.map(|(_, bytes)| bytes) }, &cancel, move |received, index, count| {
-            if let Ok(mut list) = progress_jobs.lock() {
-                if let Some(job) = list.iter_mut().find(|job| job.view.id == id) {
-                    job.view.received = received;
-                    job.view.index = index;
-                    job.view.count = count;
-                    job.view.message = if count == 0 { "正在连接".into() } else { format!("正在下载 {index}/{count}") };
-                }
-            }
-        }).await;
-        let mut list = match jobs_task.lock() {
-            Ok(list) => list,
-            Err(_) => return,
-        };
-        let Some(job) = list.iter_mut().find(|job| job.view.id == id) else { return };
-        if cancel.load(Ordering::Relaxed) {
-            job.view.phase = "cancelled".into();
-            job.view.message = "已取消".into();
-            return;
-        }
-        match result {
-            Ok(file) => {
-                let name = file_name(&title_task, episode, file.extension);
-                let temp = cache.join(format!("hghub-dl-{id}.part"));
-                if std::fs::write(&temp, &file.bytes).is_err() {
-                    job.view.phase = "failed".into();
-                    job.view.message = "无法写入临时文件".into();
-                    return;
-                }
-                match crate::local_media::publish(&temp, &name, file.mime) {
-                    Ok(saved) => {
-                        job.view.phase = "done".into();
-                        job.view.message = if file.note.is_empty() {
-                            format!("已保存到 {}", saved.location)
-                        } else {
-                            format!("{}。{}", file.note, saved.location)
-                        };
-                        job.view.path = saved.location;
-                        job.view.token = saved.token;
-                        job.view.bytes = file.bytes.len() as u64;
-                        job.view.received = file.bytes.len() as u64;
-                    }
-                    Err(err) => {
-                        job.view.phase = "failed".into();
-                        job.view.message = err;
-                    }
-                }
-                let _ = std::fs::remove_file(&temp);
-            }
-            Err(err) if err == "已取消" => {
-                job.view.phase = "cancelled".into();
-                job.view.message = "已取消".into();
-            }
-            Err(err) => {
-                job.view.phase = "failed".into();
-                job.view.message = err;
-            }
-        }
-    });
-    let list = jobs.lock().map_err(|_| "下载状态不可用")?;
-    list.iter().find(|job| job.view.id == id).map(|job| job.view.clone()).ok_or_else(|| "下载没有开始".into())
-}
-
-#[tauri::command]
-pub fn download_cancel(state: State<'_, Downloads>, id: u64) -> Result<(), String> {
-    let list = state.jobs.lock().map_err(|_| "下载状态不可用")?;
-    let job = list.iter().find(|job| job.view.id == id).ok_or("找不到这个下载")?;
-    job.cancel.store(true, Ordering::Relaxed);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn download_list(state: State<'_, Downloads>) -> Result<Vec<DownloadView>, String> {
-    let list = state.jobs.lock().map_err(|_| "下载状态不可用")?;
-    Ok(list.iter().map(|job| job.view.clone()).collect())
-}
-
-#[tauri::command]
-pub fn download_open(state: State<'_, Downloads>, id: u64) -> Result<(), String> {
-    let list = state.jobs.lock().map_err(|_| "下载状态不可用")?;
-    let job = list.iter().find(|job| job.view.id == id).ok_or("找不到这个下载")?;
-    if job.view.phase != "done" {
-        return Err("下载还没有完成".into());
+    if !media.ended {
+        return Err("这是未结束的播放列表，不能保存成一个完整文件".into());
     }
-    let token = if job.view.token.is_empty() { job.view.path.clone() } else { job.view.token.clone() };
-    let mime = if job.view.path.ends_with(".ts") { "video/mp2t" } else { "video/mp4" };
-    drop(list);
-    crate::local_media::open(&token, mime)
+    if media.segments.is_empty() {
+        return Err("播放列表里没有分片".into());
+    }
+    if media.segments.len() > MAX_SEGMENTS {
+        return Err("分片太多，已停止下载".into());
+    }
+    let paths: Vec<&str> = media.segments.iter().map(|segment| segment.url.as_str()).collect();
+    let fingerprint = hls_fingerprint(
+        HlsIdentity {
+            sequence: media.segments.first().map(|segment| segment.seq).unwrap_or(0),
+            count: media.segments.len() as u32,
+            ended: true,
+        },
+        &paths,
+    );
+    let saved = load_manifest(dir);
+    let mut complete = reusable_segments(saved.as_ref().map(|item| item.fingerprint.as_str()), &fingerprint, saved.as_ref().map(|item| item.complete.as_slice()).unwrap_or(&[]), media.segments.len() as u32);
+    if saved.as_ref().is_some_and(|item| item.fingerprint != fingerprint) {
+        clear_hls_parts(dir);
+        complete.clear();
+    }
+    complete.retain(|index| seg_file(dir, *index).is_file());
+    let mut manifest = HlsManifest { fingerprint, count: media.segments.len() as u32, complete };
+    store_manifest(dir, &manifest)?;
+    let mut key_bytes: Vec<Option<Vec<u8>>> = Vec::new();
+    for key in &media.keys {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已暂停".into());
+        }
+        if key.method == Method::Aes128 {
+            let raw = fetch(key.uri.clone()).await?;
+            if raw.len() != 16 {
+                return Err("加密密钥长度不对，无法保存".into());
+            }
+            key_bytes.push(Some(raw));
+        } else {
+            key_bytes.push(None);
+        }
+    }
+    let total = media.segments.len() as u32;
+    let mut init_url: Option<String> = None;
+    for (index, segment) in media.segments.iter().enumerate() {
+        let index = index as u32;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已暂停".into());
+        }
+        if manifest.complete.contains(&index) {
+            progress(0, index + 1, total);
+            continue;
+        }
+        if let Some(map) = &segment.map {
+            if init_url.as_deref() != Some(map.as_str()) {
+                let bytes = fetch(map.clone()).await?;
+                let part = dir.join("init.part");
+                std::fs::write(&part, &bytes).map_err(|_| "无法写入初始化分片")?;
+                std::fs::rename(&part, dir.join("init.bin")).map_err(|_| "无法写入初始化分片")?;
+                init_url = Some(map.clone());
+            }
+        }
+        let mut body = fetch(segment.url.clone()).await?;
+        if let Some(key_index) = segment.key {
+            let key = key_bytes.get(key_index).and_then(|item| item.as_ref()).ok_or("缺少解密密钥")?;
+            let iv = media.keys[key_index].iv.unwrap_or_else(|| sequence_iv(segment.seq));
+            body = aes128_cbc_decrypt(&body, key, &iv)?;
+        }
+        if body.is_empty() {
+            return Err("分片是空的，已停止拼接".into());
+        }
+        let part = dir.join(format!("seg-{index:05}.part"));
+        {
+            let mut file = std::fs::File::create(&part).map_err(|_| "无法写入分片")?;
+            file.write_all(&body).map_err(|_| "无法写入分片")?;
+            file.sync_all().map_err(|_| "无法写入分片")?;
+        }
+        std::fs::rename(&part, seg_file(dir, index)).map_err(|_| "无法写入分片")?;
+        manifest.complete.push(index);
+        manifest.complete.sort_unstable();
+        manifest.complete.dedup();
+        store_manifest(dir, &manifest)?;
+        progress(body.len() as u64, index + 1, total);
+    }
+    let order = assembly_indexes(&manifest.complete, total).ok_or("分片不完整，已停止拼接")?;
+    let joined = dir.join("joined.part");
+    {
+        let mut out = std::fs::File::create(&joined).map_err(|_| "无法拼接分片")?;
+        if dir.join("init.bin").is_file() {
+            let mut init = std::fs::File::open(dir.join("init.bin")).map_err(|_| "无法读取初始化分片")?;
+            std::io::copy(&mut init, &mut out).map_err(|_| "无法拼接分片")?;
+        }
+        for index in order {
+            let mut input = std::fs::File::open(seg_file(dir, index)).map_err(|_| "无法读取已完成分片")?;
+            std::io::copy(&mut input, &mut out).map_err(|_| "无法拼接分片")?;
+        }
+        out.sync_all().map_err(|_| "无法拼接分片")?;
+    }
+    let bytes = std::fs::read(&joined).map_err(|_| "无法读取拼接结果")?;
+    let _ = std::fs::remove_file(&joined);
+    if bytes.len() > MAX_BYTES {
+        return Err("视频超过 800MB，已停止下载".into());
+    }
+    let media = if bytes.first().copied() == Some(0x47) {
+        package_ts(bytes)
+    } else if bytes.get(4..8) == Some(b"ftyp") || bytes.get(4..8) == Some(b"styp") || bytes.get(4..8) == Some(b"moof") {
+        Ok(MediaFile { bytes, extension: "mp4", mime: "video/mp4", note: "已合并为 MP4".into() })
+    } else {
+        Err("分片不是可识别的视频数据".into())
+    }?;
+    let dest = dir.join(format!("media.{}", media.extension));
+    let tmp = dir.join("media.part");
+    std::fs::write(&tmp, &media.bytes).map_err(|_| "无法写入视频文件")?;
+    std::fs::rename(&tmp, &dest).map_err(|_| "无法写入视频文件")?;
+    std::fs::write(dir.join("ready"), media.note.as_bytes()).map_err(|_| "无法标记下载完成")?;
+    for index in 0..total {
+        let _ = std::fs::remove_file(seg_file(dir, index));
+    }
+    let _ = std::fs::remove_file(dir.join("init.bin"));
+    Ok(dest)
 }
+
+fn finished_media(dir: &Path) -> Option<PathBuf> {
+    ["media.mp4", "media.webm", "media.ts"].into_iter().map(|name| dir.join(name)).find(|path| path.is_file())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -728,5 +758,82 @@ mod tests {
         let text = String::from_utf8_lossy(&probe.stdout);
         assert!(probe.status.success() && text.contains("codec_name=h264") && text.contains("codec_name=aac"), "{text} {}", String::from_utf8_lossy(&probe.stderr));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn completed_hls_segments_resume_and_a_changed_playlist_is_not_stitched() {
+        let dir = std::env::temp_dir().join(format!("hghub-hls-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seg0 = {
+            let mut bytes = vec![0x47, b'A'];
+            bytes.extend(std::iter::repeat(1).take(20));
+            bytes
+        };
+        let seg1 = {
+            let mut bytes = vec![0x47, b'B'];
+            bytes.extend(std::iter::repeat(2).take(20));
+            bytes
+        };
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:3\n#EXTINF:1,\nhttps://cdn.example/a.ts?auth=1\n#EXTINF:1,\nhttps://cdn.example/b.ts?auth=1\n#EXT-X-ENDLIST\n";
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let fetch = {
+            let calls = Arc::clone(&calls);
+            let cancel = Arc::clone(&cancel);
+            let seg0 = seg0.clone();
+            let seg1 = seg1.clone();
+            move |url: String| {
+                let calls = Arc::clone(&calls);
+                let cancel = Arc::clone(&cancel);
+                let seg0 = seg0.clone();
+                let seg1 = seg1.clone();
+                async move {
+                    if url.contains("/a.ts") {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        cancel.store(true, Ordering::SeqCst);
+                        Ok(seg0)
+                    } else if url.contains("/b.ts") {
+                        Ok(seg1)
+                    } else {
+                        Ok(playlist.as_bytes().to_vec())
+                    }
+                }
+            }
+        };
+        let err = download_hls_resumable(&"https://cdn.example/list.m3u8".to_string(), &dir, fetch.clone(), &cancel, |_, _, _| {}).await.err().unwrap();
+        assert!(err.contains("暂停"), "{err}");
+        assert!(dir.join("seg-00000.bin").is_file());
+        assert!(!dir.join("seg-00001.bin").exists());
+        cancel.store(false, Ordering::SeqCst);
+        let saved = download_hls_resumable("https://cdn.example/list.m3u8", &dir, fetch, &cancel, |_, _, _| {}).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "已完成分片不应重下");
+        let output = std::fs::read(&saved).unwrap();
+        assert!(output.windows(2).any(|item| item == b"\x47A") && output.windows(2).any(|item| item == b"\x47B"));
+
+        let changed = std::env::temp_dir().join(format!("hghub-hls-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&changed);
+        std::fs::create_dir_all(&changed).unwrap();
+        std::fs::write(changed.join("seg-00000.bin"), b"OLD-SEGMENT-MUST-NOT-APPEAR").unwrap();
+        std::fs::write(changed.join("manifest.json"), br#"{"fingerprint":"stale","count":1,"complete":[0]}"#).unwrap();
+        let fresh = {
+            let mut bytes = vec![0x47, b'C'];
+            bytes.extend(std::iter::repeat(3).take(20));
+            bytes
+        };
+        let playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:9\n#EXTINF:1,\nhttps://cdn.example/c.ts\n#EXT-X-ENDLIST\n";
+        let saved = download_hls_resumable("https://cdn.example/other.m3u8", &changed, {
+            let fresh = fresh.clone();
+            move |url: String| {
+                let fresh = fresh.clone();
+                async move {
+                    if url.contains("/c.ts") { Ok(fresh) } else { Ok(playlist.as_bytes().to_vec()) }
+                }
+            }
+        }, &AtomicBool::new(false), |_, _, _| {}).await.unwrap();
+        let output = std::fs::read(&saved).unwrap();
+        assert!(!output.windows(4).any(|item| item == b"OLD-"));
+        assert!(output.windows(2).any(|item| item == b"\x47C"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&changed);
     }
 }

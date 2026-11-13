@@ -1,4 +1,7 @@
 mod api;
+mod download_io;
+mod download_plan;
+mod download_queue;
 mod hls_download;
 #[cfg(target_os = "ios")]
 mod ios_layout;
@@ -61,7 +64,7 @@ pub fn run() {
                 .build(),
         )
         .manage(Api::new())
-        .manage(hls_download::Downloads::new())
+        .manage(download_queue::Downloads::new())
         .on_page_load(|webview, payload| {
             #[cfg(target_os = "ios")]
             {
@@ -90,7 +93,9 @@ pub fn run() {
                 net::bind_base(&dir);
                 playback_log::bind(&dir);
                 let state: tauri::State<Api> = app.state();
-                state.session.bind(dir);
+                state.session.bind(dir.clone());
+                let downloads: tauri::State<download_queue::Downloads> = app.state();
+                downloads.attach(app.handle().clone());
             }
             // Linux 的 <video> 由 GStreamer 播放，它只认常规 HTTP scheme；
             // 这里起一个 loopback 代理，前端与 m3u8 改写都指向它（见 linux_http.rs）
@@ -153,6 +158,13 @@ pub fn run() {
             let uri = request.uri().clone();
             let path = uri.path().to_string();
             let query = uri.query().unwrap_or("").to_string();
+            let range = request.headers().get("Range").and_then(|value| value.to_str().ok()).map(str::to_string);
+            if path == "/local" {
+                tauri::async_runtime::spawn(async move {
+                    responder.respond(download_queue::local_file_response(&query, range.as_deref()));
+                });
+                return;
+            }
             // 自定义协议基址随平台不同，统一定义在 media::LOCAL_ORIGIN
             // （Windows/Android 是 http://<scheme>.localhost，macOS/iOS/Linux 是 <scheme>://localhost）。
             // 它同时是 m3u8 分片/key 改写用的前缀，必须与前端 src/api.ts 的 LOCAL 一致。
@@ -227,10 +239,15 @@ pub fn run() {
             api::api_like,
             api::api_collect,
             api::api_follow,
-            hls_download::download_start,
-            hls_download::download_cancel,
-            hls_download::download_list,
-            hls_download::download_open,
+            download_queue::download_start,
+            download_queue::download_series,
+            download_queue::download_pause,
+            download_queue::download_resume,
+            download_queue::download_cancel,
+            download_queue::download_delete,
+            download_queue::download_progress,
+            download_queue::download_list,
+            download_queue::download_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
